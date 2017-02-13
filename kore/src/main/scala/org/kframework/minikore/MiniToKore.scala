@@ -142,6 +142,9 @@ object MiniToKore {
     val argss = att.collect({
       case Application(`key`, args) => args
     })
+    //println(key)
+    //println(argss)
+    //println(att)
     assert(argss.size == 1)
     argss.head
   }
