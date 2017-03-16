@@ -1,8 +1,10 @@
 // Copyright (c) 2015-2016 K Team. All Rights Reserved.
 package org.kframework.backend.java.symbolic;
 
+import org.apache.commons.lang3.tuple.Pair;
 import org.kframework.KapiGlobal;
 import org.kframework.RewriterResult;
+import org.kframework.backend.java.MiniKoreUtils;
 import org.kframework.backend.java.compile.KOREtoBackendKIL;
 import org.kframework.backend.java.kil.ConstrainedTerm;
 import org.kframework.backend.java.kil.Definition;
@@ -14,14 +16,15 @@ import org.kframework.backend.java.kil.TermContext;
 import org.kframework.backend.java.util.JavaKRunState;
 import org.kframework.definition.Module;
 import org.kframework.definition.Rule;
+import org.kframework.kast.Kast;
 import org.kframework.kil.Attribute;
-import org.kframework.kompile.KompileOptions;
 import org.kframework.kore.K;
-import org.kframework.kore.KVariable;
 import org.kframework.krun.KRunOptions;
 import org.kframework.krun.api.KRunState;
 import org.kframework.krun.api.io.FileSystem;
 import org.kframework.main.GlobalOptions;
+import org.kframework.minikore.converters.MiniToKore;
+import org.kframework.minikore.implementation.MiniKore;
 import org.kframework.rewriter.Rewriter;
 import org.kframework.rewriter.SearchType;
 import org.kframework.utils.errorsystem.KExceptionManager;
@@ -32,6 +35,7 @@ import scala.collection.JavaConversions;
 
 import java.lang.invoke.MethodHandle;
 import java.math.BigInteger;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,7 +46,7 @@ import java.util.stream.Collectors;
 /**
  * Created by dwightguth on 5/6/15.
  */
-public class InitializeRewriter implements Function<Module, Rewriter> {
+public class InitializeRewriter implements Function<Pair<Module, MiniKore.Definition>, Rewriter> {
 
     private final FileSystem fs;
     private final boolean deterministicFunctions;
@@ -86,21 +90,30 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
     }
 
     @Override
-    public synchronized Rewriter apply(Module module) {
+    public synchronized Rewriter apply(Pair<Module, MiniKore.Definition> modulePair) {
         TermContext initializingContext = TermContext.builder(new GlobalContext(fs, deterministicFunctions, globalOptions, krunOptions, kem, smtOptions, hookProvider, files, Stage.INITIALIZING))
                 .freshCounter(0).build();
-        Definition evaluatedDef = initializeDefinition.invoke(module, kem, initializingContext.global());
-
+        MiniKore.Module mainModule = null;
+        Definition definition;
+        if (modulePair.getRight() != null) {
+            mainModule = MiniKoreUtils.getMainModule(modulePair.getRight());
+            definition = initializeDefinition.invoke(kem, initializingContext.global(), mainModule, modulePair.getRight());
+        } else {
+            definition = initializeDefinition.invoke(modulePair.getKey(), kem, initializingContext.global());
+        }
         GlobalContext rewritingContext = new GlobalContext(fs, deterministicFunctions, globalOptions, krunOptions, kem, smtOptions, hookProvider, files, Stage.REWRITING);
-        rewritingContext.setDefinition(evaluatedDef);
+        rewritingContext.setDefinition(definition);
+        Kast kastParser = new Kast(files);
+        rewritingContext.setKastParser(kastParser);
 
-        return new SymbolicRewriterGlue(module, evaluatedDef, transitions, initializingContext.getCounterValue(), rewritingContext, kem);
+        return new SymbolicRewriterGlue(modulePair.getKey(), definition, definition, transitions, initializingContext.getCounterValue(), rewritingContext, kem);
     }
 
     public static class SymbolicRewriterGlue implements Rewriter {
 
         private SymbolicRewriter rewriter;
         public final Definition definition;
+        public Definition miniKoreDefinition;
         public final Module module;
         private final BigInteger initCounterValue;
         public final GlobalContext rewritingContext;
@@ -110,6 +123,7 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
         public SymbolicRewriterGlue(
                 Module module,
                 Definition definition,
+                Definition miniKoreDefinition,
                 List<String> transitions,
                 BigInteger initCounterValue,
                 GlobalContext rewritingContext,
@@ -117,6 +131,7 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
             this.transitions = transitions;
             this.rewriter = null;
             this.definition = definition;
+            this.miniKoreDefinition = miniKoreDefinition;
             this.module = module;
             this.initCounterValue = initCounterValue;
             this.rewritingContext = rewritingContext;
@@ -127,6 +142,7 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
         public RewriterResult execute(K k, Optional<Integer> depth) {
             TermContext termContext = TermContext.builder(rewritingContext).freshCounter(initCounterValue).build();
             KOREtoBackendKIL converter = new KOREtoBackendKIL(module, definition, termContext.global(), false);
+            termContext.setKOREtoBackendKILConverter(converter);
             Term backendKil = MacroExpander.expandAndEvaluate(termContext, kem, converter.convert(k));
             this.rewriter = new SymbolicRewriter(rewritingContext, transitions, new KRunState.Counter(), converter);
             JavaKRunState result = (JavaKRunState) rewriter.rewrite(new ConstrainedTerm(backendKil, termContext), depth.orElse(-1));
@@ -143,6 +159,7 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
         public K search(K initialConfiguration, Optional<Integer> depth, Optional<Integer> bound, Rule pattern, SearchType searchType, boolean resultsAsSubstitution) {
             TermContext termContext = TermContext.builder(rewritingContext).freshCounter(initCounterValue).build();
             KOREtoBackendKIL converter = new KOREtoBackendKIL(module, definition, termContext.global(), false);
+            termContext.setKOREtoBackendKILConverter(converter);
             Term javaTerm = MacroExpander.expandAndEvaluate(termContext, kem, converter.convert(initialConfiguration));
             org.kframework.backend.java.kil.Rule javaPattern = converter.convert(Optional.empty(), pattern);
             this.rewriter = new SymbolicRewriter(rewritingContext, transitions, new KRunState.Counter(), converter);
@@ -159,6 +176,7 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
         public List<K> prove(List<Rule> rules) {
             TermContext termContext = TermContext.builder(rewritingContext).freshCounter(initCounterValue).build();
             KOREtoBackendKIL converter = new KOREtoBackendKIL(module, definition, termContext.global(), false);
+            termContext.setKOREtoBackendKILConverter(converter);
             List<org.kframework.backend.java.kil.Rule> javaRules = rules.stream()
                     .map(r -> converter.convert(Optional.<Module>empty(), r))
                     .map(r -> new org.kframework.backend.java.kil.Rule(
@@ -220,9 +238,28 @@ public class InitializeRewriter implements Function<Module, Rewriter> {
                     .map(l -> KLabelConstant.of(l.name(), definition))
                     .forEach(definition::addKLabel);
             definition.addKoreRules(module, global);
-
             cache.put(module, definition);
             return definition;
         }
+
+
+        public Definition invoke(KExceptionManager kem, GlobalContext global, MiniKore.Module miniKoreModule, MiniKore.Definition miniKoreDefinition) {
+            MiniKoreUtils.ModuleUtils moduleUtils = new MiniKoreUtils.ModuleUtils(miniKoreModule, miniKoreDefinition);
+            Definition definition = new Definition(moduleUtils, kem);
+
+            global.setDefinition(definition);
+
+            JavaConversions.setAsJavaSet(moduleUtils.attributesFor().keySet()).stream()
+                    .map(l -> KLabelConstant.of(l, definition))
+                    .forEach(definition::addKLabel);
+
+            //Todo: Bypass Conversion to Kore
+            Module koreModule = MiniToKore.apply(MiniKoreUtils.getOriginalModuleMap(miniKoreDefinition), JavaConversions.mapAsScalaMap(new HashMap<String, Module>()), miniKoreModule);
+
+            //TODO: Change add KoreRules and the converter to use MiniKore
+            definition.addKoreRules(koreModule, global);
+            return definition;
+        }
+
     }
 }
