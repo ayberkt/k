@@ -391,7 +391,7 @@ public class Main {
             CompiledDefinition compiledDef2 = loader.loadOrDie(CompiledDefinition.class, new File(def2File, "compiled.bin"));
 
             // kequiv
-            Kapi.kequiv(compiledDef0, compiledDef1, compiledDef2, prove1, prove2, prelude);
+            Kapi.kequiv(compiledDef0, compiledDef1, compiledDef2, loader, def1File, def2File, prove1, prove2, prelude);
 
             return 0;
         }
